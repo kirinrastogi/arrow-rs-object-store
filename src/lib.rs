@@ -84,6 +84,10 @@
     doc = "* [`gcp`]: [Google Cloud Storage](https://cloud.google.com/storage/) support. See [`GoogleCloudStorageBuilder`](gcp::GoogleCloudStorageBuilder)"
 )]
 #![cfg_attr(
+    feature = "gcp_rapid",
+    doc = "* [`gcp_rapid`]: [Google Cloud Storage Zonal Buckets (Rapid)](https://cloud.google.com/storage/docs/zonal-buckets) with gRPC and appendable object support. See [`GoogleCloudStorageRapidBuilder`](gcp_rapid::GoogleCloudStorageRapidBuilder)"
+)]
+#![cfg_attr(
     feature = "aws",
     doc = "* [`aws`]: [Amazon S3](https://aws.amazon.com/s3/). See [`AmazonS3Builder`](aws::AmazonS3Builder)"
 )]
@@ -548,6 +552,8 @@ pub mod chunked;
 pub mod delimited;
 #[cfg(feature = "gcp")]
 pub mod gcp;
+#[cfg(feature = "gcp_rapid")]
+pub mod gcp_rapid;
 #[cfg(feature = "http")]
 pub mod http;
 #[cfg(feature = "tokio")]

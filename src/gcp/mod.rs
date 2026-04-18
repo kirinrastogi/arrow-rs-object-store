@@ -99,6 +99,11 @@ impl GoogleCloudStorage {
     pub fn signing_credentials(&self) -> &GcpSigningCredentialProvider {
         &self.client.config().signing_credentials
     }
+
+    /// Returns the bucket name used by this [`GoogleCloudStorage`] instance
+    pub fn bucket_name(&self) -> &str {
+        &self.client.config().bucket_name
+    }
 }
 
 #[derive(Debug)]

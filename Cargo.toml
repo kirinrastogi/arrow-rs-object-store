@@ -61,6 +61,12 @@ serde = { version = "1.0", default-features = false, features = ["derive"], opti
 serde_json = { version = "1.0", default-features = false, features = ["std"], optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
 
+# gRPC support for GCS Rapid (Zonal Buckets)
+google-api-proto = { version = "1.710", default-features = false, features = ["google-storage-v2"], optional = true }
+tonic = { version = "0.12", default-features = false, features = ["tls", "tls-roots", "transport", "prost"], optional = true }
+prost = { version = "0.13", optional = true }
+prost-types = { version = "0.13", optional = true }
+
 # Optional tokio feature
 tokio = { version = "1.29.0", features = ["sync", "macros", "rt", "time", "io-util"], optional = true }
 tracing = { version = "0.1", optional = true }
@@ -85,6 +91,7 @@ cloud = ["serde", "serde_json", "quick-xml", "hyper", "reqwest", "reqwest/stream
 azure = ["cloud", "httparse"]
 fs = ["walkdir", "tokio", "nix", "windows-sys"]
 gcp = ["cloud", "rustls-pki-types"]
+gcp_rapid = ["gcp", "dep:google-api-proto", "dep:tonic", "dep:prost", "dep:prost-types"]
 aws = ["cloud", "md-5"]
 http = ["cloud"]
 tls-webpki-roots = ["reqwest?/rustls-tls-webpki-roots"]

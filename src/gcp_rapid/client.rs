@@ -133,6 +133,84 @@ pub(crate) mod bidi_data_ext {
 }
 
 // ---------------------------------------------------------------------------
+// BidiReadObject proto types (not yet in google-api-proto 1.710)
+// ---------------------------------------------------------------------------
+
+/// Opaque handle for reusing a bidirectional read stream connection.
+#[derive(Clone, PartialEq, Message)]
+pub struct BidiReadHandle {
+    /// Opaque value describing a previous read, provided by the server.
+    #[prost(bytes = "vec", tag = "1")]
+    pub handle: Vec<u8>,
+}
+
+/// A range to read from an object within a `BidiReadObject` stream.
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct ReadRange {
+    #[prost(int64, tag = "1")]
+    pub read_offset: i64,
+    #[prost(int64, tag = "2")]
+    pub read_length: i64,
+    #[prost(int64, tag = "3")]
+    pub read_id: i64,
+}
+
+/// A portion of object data returned by `BidiReadObject`.
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct ObjectRangeData {
+    #[prost(message, optional, tag = "1")]
+    pub checksummed_data: Option<ChecksummedData>,
+    #[prost(message, optional, tag = "2")]
+    pub read_range: Option<ReadRange>,
+    #[prost(bool, tag = "3")]
+    pub range_end: bool,
+}
+
+/// Specifies which object to read in a `BidiReadObject` stream.
+/// Set only in the first `BidiReadObjectRequest` message.
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct BidiReadObjectSpec {
+    #[prost(string, tag = "1")]
+    pub bucket: String,
+    #[prost(string, tag = "2")]
+    pub object: String,
+    #[prost(int64, tag = "3")]
+    pub generation: i64,
+    #[prost(int64, optional, tag = "4")]
+    pub if_generation_match: Option<i64>,
+    #[prost(int64, optional, tag = "5")]
+    pub if_generation_not_match: Option<i64>,
+    #[prost(int64, optional, tag = "6")]
+    pub if_metageneration_match: Option<i64>,
+    #[prost(int64, optional, tag = "7")]
+    pub if_metageneration_not_match: Option<i64>,
+    #[prost(message, optional, tag = "13")]
+    pub read_handle: Option<BidiReadHandle>,
+    #[prost(string, optional, tag = "14")]
+    pub routing_token: Option<String>,
+}
+
+/// Client-to-server message for the `BidiReadObject` RPC.
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct BidiReadObjectRequest {
+    #[prost(message, optional, tag = "1")]
+    pub read_object_spec: Option<BidiReadObjectSpec>,
+    #[prost(message, repeated, tag = "8")]
+    pub read_ranges: Vec<ReadRange>,
+}
+
+/// Server-to-client message for the `BidiReadObject` RPC.
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct BidiReadObjectResponse {
+    #[prost(message, repeated, tag = "6")]
+    pub object_data_ranges: Vec<ObjectRangeData>,
+    #[prost(message, optional, tag = "4")]
+    pub metadata: Option<Object>,
+    #[prost(message, optional, tag = "7")]
+    pub read_handle: Option<BidiReadHandle>,
+}
+
+// ---------------------------------------------------------------------------
 // Error mapping
 // ---------------------------------------------------------------------------
 
@@ -514,6 +592,66 @@ impl GrpcStorageClient {
 
         Ok((tx, response.into_inner()))
     }
+
+    // -- bidi read -----------------------------------------------------------
+
+    /// Open a `BidiReadObject` bidirectional stream for multi-range reads.
+    ///
+    /// Returns an mpsc sender for submitting read requests and the tonic
+    /// response stream.  The caller (`BidiReader`) owns both.
+    pub(crate) async fn bidi_read_object(
+        &self,
+        location: &Path,
+        read_handle: Option<BidiReadHandle>,
+    ) -> Result<(
+        tokio::sync::mpsc::Sender<BidiReadObjectRequest>,
+        tonic::Streaming<BidiReadObjectResponse>,
+    )> {
+        let token = self.get_bearer_token().await?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<BidiReadObjectRequest>(8);
+
+        // First message: BidiReadObjectSpec identifying the object
+        let first = BidiReadObjectRequest {
+            read_object_spec: Some(BidiReadObjectSpec {
+                bucket: self.bucket_resource(),
+                object: location.to_string(),
+                read_handle,
+                ..Default::default()
+            }),
+            read_ranges: Vec::new(),
+        };
+        tx.send(first).await.map_err(|e| Error::Generic {
+            store: STORE,
+            source: Box::new(e),
+        })?;
+
+        let request_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|msg| (msg, rx))
+        });
+
+        let mut req = Request::new(request_stream);
+        Self::inject_auth(&mut req, &token)?;
+
+        let mut grpc = tonic::client::Grpc::new(self.channel.clone());
+        grpc.ready()
+            .await
+            .map_err(|e| Error::Generic {
+                store: STORE,
+                source: Box::new(e),
+            })?;
+
+        let codec = tonic::codec::ProstCodec::default();
+        let path =
+            http::uri::PathAndQuery::from_static("/google.storage.v2.Storage/BidiReadObject");
+
+        let response: tonic::Response<tonic::Streaming<BidiReadObjectResponse>> = grpc
+            .streaming(req, path, codec)
+            .await
+            .map_err(|e| map_grpc_error(e, location.as_ref()))?;
+
+        Ok((tx, response.into_inner()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -542,7 +680,7 @@ async fn read_next_chunk(
 }
 
 /// Convert a proto `Object` to an `ObjectMeta`.
-fn object_to_meta(location: &Path, obj: &Object) -> Result<ObjectMeta> {
+pub(crate) fn object_to_meta(location: &Path, obj: &Object) -> Result<ObjectMeta> {
     let last_modified = obj
         .update_time
         .as_ref()

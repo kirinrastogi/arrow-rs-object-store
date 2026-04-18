@@ -67,6 +67,9 @@ use google_api_proto::google::storage::v2::{
     bidi_write_object_response, ChecksummedData, BidiWriteObjectResponse,
 };
 
+use std::collections::HashMap;
+use std::ops::Range;
+
 use crate::gcp::GoogleCloudStorage;
 use crate::path::Path;
 use crate::{
@@ -81,9 +84,10 @@ pub(crate) mod client;
 pub use builder::GoogleCloudStorageRapidBuilder;
 
 use client::{
-    map_grpc_error, BidiWriteObjectRequestExt, GrpcStorageClient, STORE,
-    bidi_data_ext,
+    map_grpc_error, BidiReadObjectRequest, BidiReadObjectResponse, BidiWriteObjectRequestExt,
+    GrpcStorageClient, ReadRange, STORE, bidi_data_ext,
 };
+pub use client::BidiReadHandle;
 
 // ---------------------------------------------------------------------------
 // GoogleCloudStorageRapid
@@ -209,6 +213,11 @@ impl ObjectStore for GoogleCloudStorageRapid {
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        let mut reader = self.open_bidi_reader(location).await?;
+        reader.read_ranges(ranges).await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
@@ -373,6 +382,231 @@ impl AppendWriter {
 }
 
 // ---------------------------------------------------------------------------
+// BidiReader – handle to an open BidiReadObject stream
+// ---------------------------------------------------------------------------
+
+/// A reader for efficient multi-range reads from a GCS object using the
+/// `BidiReadObject` bidirectional streaming RPC.
+///
+/// Obtained via [`BidiReadableStore::open_bidi_reader`] or
+/// [`BidiReadableStore::open_bidi_reader_with_handle`].
+///
+/// Submit one or more byte ranges with [`read_ranges`](Self::read_ranges) and
+/// receive the corresponding data.  The server may return a
+/// [`BidiReadHandle`] that can be used to open subsequent streams with
+/// connection affinity.
+pub struct BidiReader {
+    sender: tokio::sync::mpsc::Sender<BidiReadObjectRequest>,
+    response_stream: tonic::Streaming<BidiReadObjectResponse>,
+    read_handle: Option<BidiReadHandle>,
+    metadata: ObjectMeta,
+    next_read_id: i64,
+}
+
+impl fmt::Debug for BidiReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BidiReader")
+            .field("metadata", &self.metadata)
+            .field("has_read_handle", &self.read_handle.is_some())
+            .finish()
+    }
+}
+
+impl BidiReader {
+    pub(crate) async fn new(
+        sender: tokio::sync::mpsc::Sender<BidiReadObjectRequest>,
+        mut response_stream: tonic::Streaming<BidiReadObjectResponse>,
+        location: &Path,
+    ) -> Result<Self> {
+        // The first response contains object metadata
+        let first = response_stream
+            .message()
+            .await
+            .map_err(|e| map_grpc_error(e, location.as_ref()))?
+            .ok_or_else(|| Error::Generic {
+                store: STORE,
+                source: "Empty response stream from BidiReadObject".into(),
+            })?;
+
+        let obj = first.metadata.ok_or_else(|| Error::Generic {
+            store: STORE,
+            source: "No metadata in first BidiReadObject response".into(),
+        })?;
+
+        let metadata = client::object_to_meta(location, &obj)?;
+        let read_handle = first.read_handle;
+
+        Ok(Self {
+            sender,
+            response_stream,
+            read_handle,
+            metadata,
+            next_read_id: 0,
+        })
+    }
+
+    /// Object metadata obtained when the stream was opened.
+    pub fn metadata(&self) -> &ObjectMeta {
+        &self.metadata
+    }
+
+    /// Read multiple byte ranges from the object in a single round-trip.
+    ///
+    /// Returns one `Bytes` per input range, in the same order.
+    pub async fn read_ranges(&mut self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let base_id = self.next_read_id;
+        let read_ranges: Vec<ReadRange> = ranges
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let len = r.end.saturating_sub(r.start);
+                ReadRange {
+                    read_offset: r.start as i64,
+                    read_length: len as i64,
+                    read_id: base_id + i as i64,
+                }
+            })
+            .collect();
+        self.next_read_id = base_id + ranges.len() as i64;
+
+        let request = BidiReadObjectRequest {
+            read_object_spec: None,
+            read_ranges,
+        };
+        self.sender.send(request).await.map_err(|e| Error::Generic {
+            store: STORE,
+            source: Box::new(e),
+        })?;
+
+        // Accumulate data per read_id
+        let mut buffers: HashMap<i64, bytes::BytesMut> = HashMap::new();
+        let mut completed: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let expected = ranges.len();
+
+        while completed.len() < expected {
+            let resp = self
+                .response_stream
+                .message()
+                .await
+                .map_err(|e| map_grpc_error(e, "bidi_read"))?
+                .ok_or_else(|| Error::Generic {
+                    store: STORE,
+                    source: "Stream closed before all ranges were read".into(),
+                })?;
+
+            // Update read handle if refreshed
+            if let Some(handle) = resp.read_handle {
+                self.read_handle = Some(handle);
+            }
+
+            for range_data in resp.object_data_ranges {
+                let read_id = range_data
+                    .read_range
+                    .as_ref()
+                    .map(|r| r.read_id)
+                    .unwrap_or(base_id);
+
+                if let Some(cd) = range_data.checksummed_data {
+                    if !cd.content.is_empty() {
+                        buffers
+                            .entry(read_id)
+                            .or_default()
+                            .extend_from_slice(&cd.content);
+                    }
+                }
+
+                if range_data.range_end {
+                    completed.insert(read_id);
+                }
+            }
+        }
+
+        // Return results in the same order as the input ranges
+        let results = (0..ranges.len() as i64)
+            .map(|i| {
+                let id = base_id + i;
+                buffers
+                    .remove(&id)
+                    .map(|b| b.freeze())
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Read a single byte range from the object.
+    pub async fn read_range(&mut self, range: Range<u64>) -> Result<Bytes> {
+        let mut results = self.read_ranges(&[range]).await?;
+        Ok(results.remove(0))
+    }
+
+    /// Return the current read handle, if any.
+    ///
+    /// This handle can be passed to
+    /// [`BidiReadableStore::open_bidi_reader_with_handle`] to open a new
+    /// stream with connection affinity to the same server.
+    pub fn read_handle(&self) -> Option<&BidiReadHandle> {
+        self.read_handle.as_ref()
+    }
+
+    /// Close the reader, dropping the underlying gRPC stream.
+    pub fn close(self) {
+        // Dropping self closes sender + response_stream
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BidiReadableStore trait
+// ---------------------------------------------------------------------------
+
+/// Extension trait for object stores that support bidirectional streaming reads.
+///
+/// `BidiReadObject` enables efficient multi-range reads within a single gRPC
+/// stream and read-handle reuse for connection affinity.  This is supported
+/// on GCS Zonal Buckets with the Rapid storage class.
+#[async_trait]
+pub trait BidiReadableStore: ObjectStore {
+    /// Open a bidirectional read stream to the given object.
+    ///
+    /// Returns a [`BidiReader`] that supports efficient multi-range reads
+    /// and read handle reuse.
+    async fn open_bidi_reader(&self, location: &Path) -> Result<BidiReader>;
+
+    /// Open a bidirectional read stream reusing a previously obtained
+    /// [`BidiReadHandle`] for connection affinity.
+    async fn open_bidi_reader_with_handle(
+        &self,
+        location: &Path,
+        read_handle: BidiReadHandle,
+    ) -> Result<BidiReader>;
+}
+
+#[async_trait]
+impl BidiReadableStore for GoogleCloudStorageRapid {
+    async fn open_bidi_reader(&self, location: &Path) -> Result<BidiReader> {
+        let (tx, stream) = self.grpc_client.bidi_read_object(location, None).await?;
+        BidiReader::new(tx, stream, location).await
+    }
+
+    async fn open_bidi_reader_with_handle(
+        &self,
+        location: &Path,
+        read_handle: BidiReadHandle,
+    ) -> Result<BidiReader> {
+        let (tx, stream) = self
+            .grpc_client
+            .bidi_read_object(location, Some(read_handle))
+            .await?;
+        BidiReader::new(tx, stream, location).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AppendableStore trait
 // ---------------------------------------------------------------------------
 
@@ -507,6 +741,131 @@ mod tests {
         let result = store.tail_read(&path, 5).await.expect("tail_read failed");
         let bytes = result.bytes().await.expect("bytes failed");
         assert_eq!(&bytes[..], b"fghij");
+
+        store.delete(&path).await.expect("delete failed");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires GCS zonal bucket credentials"]
+    async fn rapid_bidi_read_single_range() {
+        let store = GoogleCloudStorageRapidBuilder::from_env()
+            .build()
+            .expect("failed to build rapid store");
+
+        let path = Path::from("rapid_test/bidi_single.txt");
+        let data = PutPayload::from("hello bidi read");
+        store.put(&path, data).await.expect("put failed");
+
+        let mut reader = store
+            .open_bidi_reader(&path)
+            .await
+            .expect("open_bidi_reader failed");
+
+        let bytes = reader
+            .read_range(0..5)
+            .await
+            .expect("read_range failed");
+        assert_eq!(&bytes[..], b"hello");
+
+        reader.close();
+        store.delete(&path).await.expect("delete failed");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires GCS zonal bucket credentials"]
+    async fn rapid_bidi_read_multi_range() {
+        let store = GoogleCloudStorageRapidBuilder::from_env()
+            .build()
+            .expect("failed to build rapid store");
+
+        let path = Path::from("rapid_test/bidi_multi.txt");
+        let data = PutPayload::from("aaa-bbb-ccc-ddd");
+        store.put(&path, data).await.expect("put failed");
+
+        let mut reader = store
+            .open_bidi_reader(&path)
+            .await
+            .expect("open_bidi_reader failed");
+
+        let ranges = vec![0..3, 4..7, 12..15];
+        let results = reader
+            .read_ranges(&ranges)
+            .await
+            .expect("read_ranges failed");
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(&results[0][..], b"aaa");
+        assert_eq!(&results[1][..], b"bbb");
+        assert_eq!(&results[2][..], b"ddd");
+
+        reader.close();
+        store.delete(&path).await.expect("delete failed");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires GCS zonal bucket credentials"]
+    async fn rapid_bidi_read_handle_reuse() {
+        let store = GoogleCloudStorageRapidBuilder::from_env()
+            .build()
+            .expect("failed to build rapid store");
+
+        let path = Path::from("rapid_test/bidi_handle.txt");
+        let data = PutPayload::from("handle reuse test");
+        store.put(&path, data).await.expect("put failed");
+
+        // First reader: read and obtain handle
+        let mut reader = store
+            .open_bidi_reader(&path)
+            .await
+            .expect("open_bidi_reader failed");
+
+        let bytes = reader
+            .read_range(0..6)
+            .await
+            .expect("read_range failed");
+        assert_eq!(&bytes[..], b"handle");
+
+        let handle = reader.read_handle().cloned();
+        reader.close();
+
+        // Second reader: reuse handle if available
+        if let Some(h) = handle {
+            let mut reader2 = store
+                .open_bidi_reader_with_handle(&path, h)
+                .await
+                .expect("open_bidi_reader_with_handle failed");
+
+            let bytes2 = reader2
+                .read_range(7..12)
+                .await
+                .expect("read_range failed");
+            assert_eq!(&bytes2[..], b"reuse");
+            reader2.close();
+        }
+
+        store.delete(&path).await.expect("delete failed");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires GCS zonal bucket credentials"]
+    async fn rapid_get_ranges_via_bidi() {
+        let store = GoogleCloudStorageRapidBuilder::from_env()
+            .build()
+            .expect("failed to build rapid store");
+
+        let path = Path::from("rapid_test/get_ranges.txt");
+        let data = PutPayload::from("0123456789abcdef");
+        store.put(&path, data).await.expect("put failed");
+
+        let ranges = vec![0..4, 10..14];
+        let results = store
+            .get_ranges(&path, &ranges)
+            .await
+            .expect("get_ranges failed");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(&results[0][..], b"0123");
+        assert_eq!(&results[1][..], b"abcd");
 
         store.delete(&path).await.expect("delete failed");
     }
